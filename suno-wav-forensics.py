@@ -543,7 +543,7 @@ def main():
         0.10 * basic_similarity
     ) * 100.0
 
-    # Detection-biased calibration
+    # Detection calibration
     likelihood_score = likelihood_score * 0.85 + 10.0
     likelihood_score = float(max(0.0, min(100.0, likelihood_score)))
 
