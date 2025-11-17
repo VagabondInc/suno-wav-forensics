@@ -522,16 +522,24 @@ def main():
         return f"{level} – {trend}"
 
     # Weighting: residuals heavy, correlation + similarity medium, highband moderate
-    likelihood_score_raw = (
-        0.30 * comp_residual_full
-        + 0.20 * comp_residual_lp
-        + 0.20 * comp_corr
-        + 0.15 * comp_highband
-        + 0.15 * basic_similarity
+    likelihood_components = {
+        "residual_full": sim_res_full,
+        "residual_lowpassed": sim_res_lp,
+        "correlation": sim_corr,
+        "highband": sim_hb,
+        "basic": basic_similarity
+    }
+
+    likelihood_score = (
+        0.32 * sim_res_full +
+        0.22 * sim_res_lp +
+        0.22 * sim_corr +
+        0.14 * sim_hb +
+        0.10 * basic_similarity
     ) * 100.0
 
     # Detection-biased calibration: nudge toward MP3-derived in ambiguous regimes
-    likelihood_score = likelihood_score_raw * 0.85 + 10.0
+    likelihood_score = likelihood_score * 0.85 + 10.0
     likelihood_score = float(max(0.0, min(100.0, likelihood_score)))
 
     # Textual classification
