@@ -1,593 +1,837 @@
 #!/usr/bin/env python3
-"""
-suno_wav_forensics.py
-
-Usage (from macOS Terminal):
-
-    python3 suno_wav_forensics.py \
-        --mp3 ~/Downloads/suno-test.mp3 \
-        --wav ~/Downloads/suno-test.wav \
-        --out ~/Downloads/suno_report.html
-"""
-
-import argparse
 import os
-import math
-import json
-from dataclasses import dataclass, asdict
-
+import subprocess
 import numpy as np
+import soundfile as sf
 import librosa
 import librosa.display
 import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfilt, chirp
+import pyloudnorm as pyln
 
-# -----------------------------
-# Utility & loading
-# -----------------------------
+# =========================
+# CONFIG
+# =========================
+MP3_PATH = os.path.expanduser("~/Downloads/suno-test.mp3")
+WAV_PATH = os.path.expanduser("~/Downloads/suno-test.wav")
+WORKDIR = "suno_forensics_output"
+os.makedirs(WORKDIR, exist_ok=True)
 
-def load_audio(path, sr=44100, mono=True):
-    y, fs = librosa.load(path, sr=sr, mono=mono)
-    return y.astype(np.float32), fs
+N_FFT = 4096
+HOP_LENGTH = 1024
 
-def rms(x):
-    x = np.asarray(x, dtype=np.float32)
-    return float(np.sqrt(np.mean(x**2) + 1e-12))
+# =========================
+# UTILS
+# =========================
+def ensure_exists(path, label):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label} not found at: {path}")
 
-def normalize(x):
-    peak = np.max(np.abs(x))
-    if peak < 1e-9:
-        return x
-    return x / peak
-
-def bandpass_fft(x, sr, f_low, f_high):
+def save_waveform(y, sr, outpath, title="", zoom=None):
     """
-    Zero everything outside [f_low, f_high] in the FFT domain.
-    Return time-domain signal.
+    zoom: (start_sec, end_sec) or None
     """
-    x = np.asarray(x, dtype=np.float32)
-    N = len(x)
-    X = np.fft.rfft(x)
-    freqs = np.fft.rfftfreq(N, d=1/sr)
+    plt.figure(figsize=(12, 4))
+    if zoom is not None:
+        start = int(zoom[0] * sr)
+        end = int(zoom[1] * sr)
+        y_plot = y[start:end]
+        times = np.linspace(zoom[0], zoom[1], len(y_plot))
+        plt.plot(times, y_plot)
+        plt.xlim(zoom[0], zoom[1])
+    else:
+        times = np.linspace(0, len(y) / sr, num=len(y))
+        plt.plot(times, y)
+        plt.xlim(0, len(y) / sr)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(outpath)
+    plt.close()
 
-    mask = (freqs >= f_low) & (freqs <= f_high)
-    X_filtered = np.zeros_like(X)
-    X_filtered[mask] = X[mask]
+def save_spectrogram(y, sr, outpath, title="", cmap="magma", log_freq=True):
+    plt.figure(figsize=(12, 4))
+    S = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH))
+    S_db = librosa.amplitude_to_db(S, ref=np.max)
+    if log_freq:
+        librosa.display.specshow(
+            S_db,
+            sr=sr,
+            hop_length=HOP_LENGTH,
+            x_axis="time",
+            y_axis="log",
+            cmap=cmap,
+        )
+    else:
+        librosa.display.specshow(
+            S_db,
+            sr=sr,
+            hop_length=HOP_LENGTH,
+            x_axis="time",
+            y_axis="linear",
+            cmap=cmap,
+        )
+    plt.title(title)
+    plt.colorbar(format="%+2.0f dB")
+    plt.tight_layout()
+    plt.savefig(outpath)
+    plt.close()
 
-    y = np.fft.irfft(X_filtered, n=N)
-    return y.astype(np.float32)
+def lowpass_filter(y, sr, cutoff=16000.0, order=10):
+    sos = butter(order, cutoff / (sr / 2.0), btype="lowpass", output="sos")
+    return sosfilt(sos, y)
 
-def highband_energy_ratio(x, sr, split_hz=16000.0, top_hz=22050.0):
+def highband_mask(sr, n_fft, low=16000.0, high=None):
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    if high is None:
+        high = sr / 2.0
+    return (freqs >= low) & (freqs <= high)
+
+def compute_rms(y):
+    return float(np.sqrt(np.mean(y**2) + 1e-15))
+
+def compute_peak(y):
+    return float(np.max(np.abs(y)) + 1e-15)
+
+def compute_crest_factor(y):
+    rms = compute_rms(y)
+    peak = compute_peak(y)
+    return 20.0 * np.log10(peak / rms)
+
+def compute_lufs(y, sr):
+    meter = pyln.Meter(sr)  # EBU R128
+    return float(meter.integrated_loudness(y))
+
+def align_signals(a, b):
     """
-    Energy in [split_hz, top_hz] / total energy.
+    Naive alignment: trim both to min length.
     """
-    x = np.asarray(x, dtype=np.float32)
-    N = len(x)
-    X = np.fft.rfft(x)
-    freqs = np.fft.rfftfreq(N, d=1/sr)
+    min_len = min(len(a), len(b))
+    return a[:min_len], b[:min_len]
 
-    total = np.sum(np.abs(X)**2) + 1e-12
-    mask_hi = (freqs >= split_hz) & (freqs <= top_hz)
-    hi = np.sum(np.abs(X[mask_hi])**2)
-    return float(hi / total)
+def compute_band_energies(y, sr, bands):
+    """
+    bands: list of (low_freq, high_freq, label)
+    returns dict label -> energy
+    """
+    S = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=N_FFT)
+    energies = {}
+    for low, high, label in bands:
+        mask = (freqs >= low) & (freqs < high)
+        if not np.any(mask):
+            energies[label] = 0.0
+        else:
+            band_energy = float(np.mean(S[mask, :]))
+            energies[label] = band_energy
+    return energies
 
-def pearson_corr(a, b):
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    n = min(len(a), len(b))
-    if n < 10:
-        return 0.0
-    a = a[:n]
-    b = b[:n]
+def phase_correlation(a, b):
+    """
+    Simple normalized correlation between two aligned signals.
+    """
     a = a - np.mean(a)
     b = b - np.mean(b)
-    num = float(np.sum(a * b))
-    den = float(np.sqrt(np.sum(a**2) * np.sum(b**2)) + 1e-12)
-    return num / den
+    denom = np.sqrt(np.sum(a**2) * np.sum(b**2)) + 1e-15
+    return float(np.sum(a * b) / denom)
 
-# -----------------------------
-# Analysis dataclasses
-# -----------------------------
+def save_histogram(y, outpath, title="", bins=100, range_=(-1, 1)):
+    plt.figure(figsize=(8, 4))
+    plt.hist(y, bins=bins, range=range_, density=True)
+    plt.title(title)
+    plt.xlabel("Amplitude")
+    plt.ylabel("Density")
+    plt.tight_layout()
+    plt.savefig(outpath)
+    plt.close()
 
-@dataclass
-class MetricResult:
-    name: str
-    value: float
-    explanation: str
-    confidence: str  # "Low" | "Medium" | "High"
+def run_ffmpeg_decode_to_wav(src_path, dst_path, target_sr=None, stereo=True):
+    cmd = ["ffmpeg", "-y", "-i", src_path]
+    if target_sr is not None:
+        cmd += ["-ar", str(target_sr)]
+    if stereo:
+        cmd += ["-ac", "2"]
+    cmd += [dst_path]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-@dataclass
-class AnalysisResults:
-    correlation: MetricResult
-    residual_full_ratio: MetricResult
-    residual_low_ratio: MetricResult
-    hf_energy_mp3: MetricResult
-    hf_energy_wav: MetricResult
-    hf_ratio_wav_vs_mp3: MetricResult
-    probability_mp3_derived: float
-    probability_explanation: str
+# =========================
+# MAIN LOGIC
+# =========================
+def main():
+    ensure_exists(MP3_PATH, "MP3 file")
+    ensure_exists(WAV_PATH, "WAV file")
 
-# -----------------------------
-# Metric interpretation helpers
-# -----------------------------
+    print("Loading audio...")
 
-def label_confidence(value, low_thr, high_thr, invert=False):
-    """
-    Simple 3-way confidence label.
-    If invert=False:
-        value < low_thr  -> Low
-        low_thr..high_thr -> Medium
-        > high_thr       -> High
-    If invert=True, flip the logic (useful when "lower is stronger").
-    """
-    if invert:
-        # lower = stronger
-        if value > high_thr:
-            return "Low"
-        elif value > low_thr:
-            return "Medium"
-        else:
-            return "High"
-    else:
-        # higher = stronger
-        if value < low_thr:
-            return "Low"
-        elif value < high_thr:
-            return "Medium"
-        else:
-            return "High"
+    # Use librosa to load, then unify SR
+    mp3_y, mp3_sr = librosa.load(MP3_PATH, sr=None, mono=True)
+    wav_y, wav_sr = librosa.load(WAV_PATH, sr=None, mono=True)
 
-# -----------------------------
-# Core analysis
-# -----------------------------
+    print(f"MP3 SR: {mp3_sr}, WAV SR: {wav_sr}")
 
-def run_analysis(mp3_path, wav_path, out_dir, sr=44100):
-    os.makedirs(out_dir, exist_ok=True)
+    # Resample so both share the same SR
+    target_sr = max(mp3_sr, wav_sr)
+    if mp3_sr != target_sr:
+        mp3_y = librosa.resample(mp3_y, orig_sr=mp3_sr, target_sr=target_sr)
+        mp3_sr = target_sr
+    if wav_sr != target_sr:
+        wav_y = librosa.resample(wav_y, orig_sr=wav_sr, target_sr=target_sr)
+        wav_sr = target_sr
 
-    # Load & normalize
-    mp3, fs1 = load_audio(mp3_path, sr=sr)
-    wav, fs2 = load_audio(wav_path, sr=sr)
+    sr = target_sr
+    print(f"Common SR: {sr}")
 
-    mp3 = normalize(mp3)
-    wav = normalize(wav)
+    # -------------------------
+    # BASELINE: MP3 → WAV roundtrip
+    # -------------------------
+    print("Creating baseline MP3-derived WAV...")
+    baseline_mp3_wav_path = os.path.join(WORKDIR, "baseline_mp3_derived.wav")
+    run_ffmpeg_decode_to_wav(MP3_PATH, baseline_mp3_wav_path, target_sr=sr, stereo=False)
+    baseline_y, baseline_sr = librosa.load(baseline_mp3_wav_path, sr=None, mono=True)
 
-    n = min(len(mp3), len(wav))
-    mp3 = mp3[:n]
-    wav = wav[:n]
+    # Align everything
+    mp3_y, wav_y = align_signals(mp3_y, wav_y)
+    mp3_y, baseline_y = align_signals(mp3_y, baseline_y)
+    # Align all to same min length
+    min_len = min(len(mp3_y), len(wav_y), len(baseline_y))
+    mp3_y = mp3_y[:min_len]
+    wav_y = wav_y[:min_len]
+    baseline_y = baseline_y[:min_len]
 
-    # --- Correlation ---
-    corr = pearson_corr(wav, mp3)
+    duration_sec = min_len / sr
+    print(f"Aligned duration: {duration_sec:.2f} s")
 
-    corr_expl = (
-        f"Pearson correlation between WAV and MP3 is {corr:.6f}. "
-        "Values above ~0.99 usually indicate the same underlying performance and "
-        "very similar mix; above ~0.999 suggests extremely tight similarity."
+    # -------------------------
+    # BASIC METRICS
+    # -------------------------
+    def basic_metrics(label, y):
+        return {
+            "label": label,
+            "rms": compute_rms(y),
+            "peak": compute_peak(y),
+            "crest_db": compute_crest_factor(y),
+            "lufs": compute_lufs(y, sr),
+        }
+
+    print("Computing loudness and dynamics...")
+    metrics_mp3 = basic_metrics("MP3", mp3_y)
+    metrics_wav = basic_metrics("WAV", wav_y)
+    metrics_baseline = basic_metrics("Baseline_MP3_Derived", baseline_y)
+
+    # -------------------------
+    # NULL TESTS
+    # -------------------------
+    print("Running null tests...")
+
+    residual_unknown = wav_y - mp3_y
+    residual_baseline = baseline_y - mp3_y
+
+    residual_unknown_path = os.path.join(WORKDIR, "residual_unknown_full.wav")
+    residual_baseline_path = os.path.join(WORKDIR, "residual_baseline_full.wav")
+    sf.write(residual_unknown_path, residual_unknown, sr)
+    sf.write(residual_baseline_path, residual_baseline, sr)
+
+    # Band-limited (below 16kHz)
+    mp3_lp = lowpass_filter(mp3_y, sr, cutoff=16000.0)
+    wav_lp = lowpass_filter(wav_y, sr, cutoff=16000.0)
+    baseline_lp = lowpass_filter(baseline_y, sr, cutoff=16000.0)
+
+    residual_unknown_lp = wav_lp - mp3_lp
+    residual_baseline_lp = baseline_lp - mp3_lp
+
+    residual_unknown_lp_path = os.path.join(WORKDIR, "residual_unknown_lowpassed.wav")
+    residual_baseline_lp_path = os.path.join(WORKDIR, "residual_baseline_lowpassed.wav")
+    sf.write(residual_unknown_lp_path, residual_unknown_lp, sr)
+    sf.write(residual_baseline_lp_path, residual_baseline_lp, sr)
+
+    # Residual stats
+    rms_mp3 = compute_rms(mp3_y)
+    rms_res_unknown = compute_rms(residual_unknown)
+    rms_res_baseline = compute_rms(residual_baseline)
+    rms_res_unknown_lp = compute_rms(residual_unknown_lp)
+    rms_res_baseline_lp = compute_rms(residual_baseline_lp)
+
+    residual_ratio_unknown = rms_res_unknown / (rms_mp3 + 1e-15)
+    residual_ratio_baseline = rms_res_baseline / (rms_mp3 + 1e-15)
+    residual_ratio_unknown_lp = rms_res_unknown_lp / (rms_mp3 + 1e-15)
+    residual_ratio_baseline_lp = rms_res_baseline_lp / (rms_mp3 + 1e-15)
+
+    # -------------------------
+    # PHASE CORRELATION
+    # -------------------------
+    print("Computing phase correlations...")
+    corr_wav_mp3 = phase_correlation(wav_y, mp3_y)
+    corr_baseline_mp3 = phase_correlation(baseline_y, mp3_y)
+
+    # -------------------------
+    # BAND ENERGIES
+    # -------------------------
+    print("Computing band energies...")
+    bands = [
+        (0, 5000, "0–5k"),
+        (5000, 10000, "5–10k"),
+        (10000, 16000, "10–16k"),
+        (16000, sr / 2.0, "16k–Nyq"),
+    ]
+
+    band_mp3 = compute_band_energies(mp3_y, sr, bands)
+    band_wav = compute_band_energies(wav_y, sr, bands)
+    band_baseline = compute_band_energies(baseline_y, sr, bands)
+
+    # Relative high-band energy
+    def highband_ratio(bands_dict):
+        total = sum(bands_dict.values()) + 1e-15
+        return bands_dict["16k–Nyq"] / total
+
+    highband_mp3 = highband_ratio(band_mp3)
+    highband_wav = highband_ratio(band_wav)
+    highband_baseline = highband_ratio(band_baseline)
+
+    # -------------------------
+    # HISTOGRAMS
+    # -------------------------
+    print("Rendering histograms...")
+    save_histogram(mp3_y, os.path.join(WORKDIR, "hist_mp3.png"), "Amplitude Histogram - MP3")
+    save_histogram(wav_y, os.path.join(WORKDIR, "hist_wav.png"), "Amplitude Histogram - WAV")
+    save_histogram(
+        residual_unknown,
+        os.path.join(WORKDIR, "hist_residual_unknown.png"),
+        "Amplitude Histogram - Residual (WAV - MP3)",
+        bins=200,
+        range_=(-0.5, 0.5),
     )
-    corr_conf = label_confidence(corr, low_thr=0.98, high_thr=0.995, invert=False)
-    corr_metric = MetricResult(
-        name="Full-band Pearson correlation",
-        value=corr,
-        explanation=corr_expl,
-        confidence=corr_conf,
+    save_histogram(
+        residual_baseline,
+        os.path.join(WORKDIR, "hist_residual_baseline.png"),
+        "Amplitude Histogram - Residual (Baseline - MP3)",
+        bins=200,
+        range_=(-0.5, 0.5),
     )
 
-    # --- Residual / null test (full band) ---
-    resid = wav - mp3
-    resid_rms = rms(resid)
-    mp3_rms = rms(mp3)
-    resid_ratio_full = resid_rms / (mp3_rms + 1e-12)
-
-    resid_full_expl = (
-        f"Residual RMS / MP3 RMS (full band) = {resid_ratio_full:.6f}. "
-        "Values near 0 mean almost perfect cancellation (identical signals). "
-        "Values below ~0.15 indicate the signals are very similar but not identical."
+    # -------------------------
+    # WAVEFORMS
+    # -------------------------
+    print("Rendering waveforms...")
+    save_waveform(mp3_y, sr, os.path.join(WORKDIR, "wave_mp3_full.png"), "Waveform - MP3 (Full)")
+    save_waveform(wav_y, sr, os.path.join(WORKDIR, "wave_wav_full.png"), "Waveform - WAV (Full)")
+    save_waveform(
+        baseline_y,
+        sr,
+        os.path.join(WORKDIR, "wave_baseline_full.png"),
+        "Waveform - Baseline MP3-derived (Full)",
     )
-    resid_full_conf = label_confidence(resid_ratio_full, low_thr=0.25, high_thr=0.15, invert=True)
-    resid_full_metric = MetricResult(
-        name="Residual RMS ratio (full band)",
-        value=resid_ratio_full,
-        explanation=resid_full_expl,
-        confidence=resid_full_conf,
+    save_waveform(
+        residual_unknown,
+        sr,
+        os.path.join(WORKDIR, "wave_residual_unknown_full.png"),
+        "Residual (WAV - MP3) Waveform (Full)",
     )
-
-    # --- Residual / null test (<16 kHz band) ---
-    low_mp3 = bandpass_fft(mp3, sr, 20.0, 16000.0)
-    low_wav = bandpass_fft(wav, sr, 20.0, 16000.0)
-    low_resid = low_wav - low_mp3
-    low_resid_ratio = rms(low_resid) / (rms(low_mp3) + 1e-12)
-
-    resid_low_expl = (
-        f"Residual RMS / MP3 RMS (<16 kHz) = {low_resid_ratio:.6f}. "
-        "If this closely matches the full-band residual ratio, it suggests the "
-        "difference is broadband processing, not only in the extreme high end."
-    )
-    # Compare similarity of low-band and full-band
-    similarity = 1.0 - abs(low_resid_ratio - resid_ratio_full) / max(resid_ratio_full, 1e-6)
-    # similarity close to 1 => strong evidence of broadband similarity
-    resid_low_conf = label_confidence(similarity, low_thr=0.6, high_thr=0.85, invert=False)
-    resid_low_metric = MetricResult(
-        name="Residual RMS ratio (<16 kHz)",
-        value=low_resid_ratio,
-        explanation=resid_low_expl,
-        confidence=resid_low_conf,
+    save_waveform(
+        residual_baseline,
+        sr,
+        os.path.join(WORKDIR, "wave_residual_baseline_full.png"),
+        "Residual (Baseline - MP3) Waveform (Full)",
     )
 
-    # --- High-frequency energy ratios ---
-    hf_mp3 = highband_energy_ratio(mp3, sr, split_hz=16000.0, top_hz=sr/2)
-    hf_wav = highband_energy_ratio(wav, sr, split_hz=16000.0, top_hz=sr/2)
-
-    hf_ratio = (hf_wav + 1e-9) / (hf_mp3 + 1e-9)
-
-    hf_mp3_expl = (
-        f"MP3 high-band (≥16 kHz) energy fraction = {hf_mp3:.6e}. "
-        "Very low values here are consistent with standard lossy roll-off."
-    )
-    hf_wav_expl = (
-        f"WAV high-band (≥16 kHz) energy fraction = {hf_wav:.6e}. "
-        "Larger values than MP3 often indicate reconstructed or synthetic 'air'."
-    )
-    hf_ratio_expl = (
-        f"WAV high-band / MP3 high-band energy ratio = {hf_ratio:.2f}. "
-        "Very large ratios (e.g., > 5–10×) suggest that the WAV has extra "
-        "high-frequency energy on top of an MP3-like base, not original detail."
-    )
-
-    hf_mp3_conf = label_confidence(hf_mp3, low_thr=1e-3, high_thr=1e-2, invert=True)
-    hf_wav_conf = label_confidence(hf_wav, low_thr=1e-3, high_thr=1e-2, invert=False)
-    hf_ratio_conf = label_confidence(hf_ratio, low_thr=3.0, high_thr=10.0, invert=False)
-
-    hf_mp3_metric = MetricResult(
-        name="MP3 high-band energy fraction (≥16 kHz)",
-        value=hf_mp3,
-        explanation=hf_mp3_expl,
-        confidence=hf_mp3_conf,
-    )
-    hf_wav_metric = MetricResult(
-        name="WAV high-band energy fraction (≥16 kHz)",
-        value=hf_wav,
-        explanation=hf_wav_expl,
-        confidence=hf_wav_conf,
-    )
-    hf_ratio_metric = MetricResult(
-        name="High-band energy ratio (WAV / MP3)",
-        value=hf_ratio,
-        explanation=hf_ratio_expl,
-        confidence=hf_ratio_conf,
-    )
-
-    # -----------------------------
-    # Heuristic probability scoring
-    # -----------------------------
-    # This is explicitly an inference, not a "fact".
-
-    score = 0.0
-    explanations = []
-
-    # 1. Correlation: 0.99–0.995–1.0
-    if corr > 0.995:
-        score += 35
-        explanations.append("Very high correlation (>0.995) suggests same underlying mix/source.")
-    elif corr > 0.99:
-        score += 20
-        explanations.append("High correlation (>0.99) suggests closely related audio.")
-    else:
-        explanations.append("Correlation not extremely high; weakens MP3-derived hypothesis.")
-
-    # 2. Residual full-band: low residual = high similarity
-    if resid_ratio_full < 0.05:
-        score += 25
-        explanations.append("Residual ratio <0.05 (very strong similarity; near-null).")
-    elif resid_ratio_full < 0.15:
-        score += 18
-        explanations.append("Residual ratio <0.15 (strong similarity, consistent with MP3-derived + processing).")
-    elif resid_ratio_full < 0.3:
-        score += 8
-        explanations.append("Residual ratio <0.3 (moderate similarity).")
-    else:
-        explanations.append("Residual ratio is large; weakens MP3-derived hypothesis.")
-
-    # 3. Broadband similarity: low-band residual close to full-band residual
-    diff = abs(low_resid_ratio - resid_ratio_full)
-    rel = diff / max(resid_ratio_full, 1e-6)
-    if rel < 0.1:
-        score += 15
-        explanations.append("Low-band and full-band residuals match closely (broadband processing).")
-    elif rel < 0.25:
-        score += 8
-        explanations.append("Low-band vs full-band residuals are somewhat similar.")
-    else:
-        explanations.append("Residual pattern differs between bands; weaker evidence.")
-
-    # 4. HF shelf / reconstruction: MP3 HF very low, WAV HF higher
-    if hf_mp3 < 1e-3 and hf_ratio > 5.0:
-        score += 20
-        explanations.append(
-            "MP3 high-band energy extremely low, but WAV has much more HF energy "
-            "(strongly suggests synthetic/reconstructed 'air' on top of a lossy base)."
+    # Zoom on first 5 seconds for detail
+    for (sig, name) in [
+        (mp3_y, "mp3"),
+        (wav_y, "wav"),
+        (baseline_y, "baseline"),
+        (residual_unknown, "residual_unknown"),
+        (residual_baseline, "residual_baseline"),
+    ]:
+        save_waveform(
+            sig,
+            sr,
+            os.path.join(WORKDIR, f"wave_{name}_zoom.png"),
+            f"Waveform - {name} (0–5s)",
+            zoom=(0, min(5, duration_sec)),
         )
-    elif hf_mp3 < 5e-3 and hf_ratio > 3.0:
-        score += 10
-        explanations.append(
-            "MP3 high-band relatively low and WAV HF noticeably higher (suggestive but not decisive)."
-        )
-    else:
-        explanations.append("HF behavior not strongly indicative of MP3-derived reconstruction.")
 
-    # Clip score into [0, 100]
-    score = max(0.0, min(100.0, score))
+    # -------------------------
+    # SPECTROGRAMS (multi-style)
+    # -------------------------
+    print("Rendering spectrograms...")
+    cmaps = ["magma", "viridis", "plasma"]
 
-    prob_expl = (
-        "This probability is a heuristic estimate of how likely the WAV is derived from "
-        "the same lossy MP3-like source, possibly with additional DSP or upscaling. "
-        "It is not a mathematical proof, but aggregates correlation, null-test residuals, "
-        "and high-frequency behavior into a single interpretable number."
+    def render_all_specs(prefix, y, label):
+        for cmap in cmaps:
+            save_spectrogram(
+                y,
+                sr,
+                os.path.join(WORKDIR, f"spec_{prefix}_{cmap}_log.png"),
+                f"{label} Spectrogram (log, {cmap})",
+                cmap=cmap,
+                log_freq=True,
+            )
+            save_spectrogram(
+                y,
+                sr,
+                os.path.join(WORKDIR, f"spec_{prefix}_{cmap}_linear.png"),
+                f"{label} Spectrogram (linear, {cmap})",
+                cmap=cmap,
+                log_freq=False,
+            )
+
+    render_all_specs("mp3", mp3_y, "MP3")
+    render_all_specs("wav", wav_y, "WAV")
+    render_all_specs("baseline", baseline_y, "Baseline MP3-derived")
+    render_all_specs("residual_unknown", residual_unknown, "Residual (WAV - MP3)")
+    render_all_specs("residual_baseline", residual_baseline, "Residual (Baseline - MP3)")
+
+    # -------------------------
+    # SYNTHETIC CHIRP REFERENCE
+    # -------------------------
+    print("Generating synthetic CHIRP reference...")
+    chirp_duration = 3.0
+    t = np.linspace(0, chirp_duration, int(sr * chirp_duration), endpoint=False)
+    chirp_sig = chirp(
+        t,
+        f0=20.0,
+        f1=sr / 2.1,
+        t1=chirp_duration,
+        method="logarithmic",
+    )
+    chirp_sig = chirp_sig * 0.9  # headroom
+
+    chirp_wav_path = os.path.join(WORKDIR, "chirp_wideband.wav")
+    sf.write(chirp_wav_path, chirp_sig, sr)
+
+    chirp_mp3_path = os.path.join(WORKDIR, "chirp_wideband.mp3")
+    # encode chirp to MP3 using ffmpeg, then decode back
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            chirp_wav_path,
+            "-b:a",
+            "192k",
+            chirp_mp3_path,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
     )
 
-    results = AnalysisResults(
-        correlation=corr_metric,
-        residual_full_ratio=resid_full_metric,
-        residual_low_ratio=resid_low_metric,
-        hf_energy_mp3=hf_mp3_metric,
-        hf_energy_wav=hf_wav_metric,
-        hf_ratio_wav_vs_mp3=hf_ratio_metric,
-        probability_mp3_derived=score,
-        probability_explanation=prob_expl + " " + " ".join(explanations),
+    chirp_mp3_decoded_path = os.path.join(WORKDIR, "chirp_wideband_mp3_decoded.wav")
+    run_ffmpeg_decode_to_wav(chirp_mp3_path, chirp_mp3_decoded_path, target_sr=sr, stereo=False)
+
+    chirp_decoded, _ = librosa.load(chirp_mp3_decoded_path, sr=None, mono=True)
+    chirp_sig, chirp_decoded = align_signals(chirp_sig, chirp_decoded)
+
+    # Spectrograms of chirp original vs mp3-decoded
+    save_spectrogram(
+        chirp_sig,
+        sr,
+        os.path.join(WORKDIR, "spec_chirp_original_log.png"),
+        "Synthetic CHIRP (Original, log)",
+        cmap="magma",
+        log_freq=True,
+    )
+    save_spectrogram(
+        chirp_decoded,
+        sr,
+        os.path.join(WORKDIR, "spec_chirp_decoded_log.png"),
+        "Synthetic CHIRP (MP3-decoded, log)",
+        cmap="magma",
+        log_freq=True,
     )
 
-    # -----------------------------
-    # Visualization
-    # -----------------------------
-    def save_waveform(y, sr, title, filename):
-        plt.figure(figsize=(10, 3))
-        librosa.display.waveshow(y, sr=sr)
-        plt.title(title)
-        plt.xlabel("Time (s)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, filename), dpi=150)
-        plt.close()
+    # -------------------------
+    # ENHANCED HEURISTIC LIKELIHOOD SCORE
+    # -------------------------
+    print("Computing enhanced likelihood score...")
 
-    def save_spectrogram(y, sr, title, filename, log_scale=True):
-        plt.figure(figsize=(10, 4))
-        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))**2
-        S_db = librosa.power_to_db(S, ref=np.max)
-        if log_scale:
-            librosa.display.specshow(S_db, sr=sr, hop_length=512, x_axis='time', y_axis='log')
-            plt.ylabel("Log frequency (Hz)")
+    # ---- Basic similarity component (loudness / dynamics) ----
+    lufs_delta_wav = abs(metrics_wav["lufs"] - metrics_mp3["lufs"])
+    crest_delta_wav = abs(metrics_wav["crest_db"] - metrics_mp3["crest_db"])
+    rms_ratio_wav = metrics_wav["rms"] / (metrics_mp3["rms"] + 1e-15)
+
+    def similarity_from_delta(delta, max_delta):
+        # 0 delta => 1.0 score, >= max_delta => 0
+        return max(0.0, min(1.0, 1.0 - (delta / max_delta)))
+
+    sim_lufs = similarity_from_delta(lufs_delta_wav, 3.0)           # 0–3 dB window
+    sim_crest = similarity_from_delta(crest_delta_wav, 6.0)         # 0–6 dB window
+    sim_rms = similarity_from_delta(abs(1.0 - rms_ratio_wav), 0.5)  # ±50% RMS
+
+    basic_similarity = float(0.4 * sim_lufs + 0.3 * sim_crest + 0.3 * sim_rms)
+
+    # ---- Residual-based components ----
+    def residual_likelihood_component(unknown, baseline):
+        # If unknown <= baseline → strongest evidence (perfect repack)
+        if unknown <= baseline:
+            return 1.0
+        # Otherwise decay with ratio
+        return max(0.0, min(1.0, baseline / (unknown + 1e-15)))
+
+    # ---- Correlation component ----
+    def corr_likelihood_component(corr_unknown, corr_baseline):
+        diff = abs(corr_unknown - corr_baseline)
+        # diff 0 -> 1, diff >= 0.2 -> ~0
+        return max(0.0, min(1.0, 1.0 - diff / 0.2))
+
+    # ---- High-band pattern component ----
+    def highband_likelihood_component(hb_mp3, hb_wav, hb_baseline):
+        if hb_baseline < 1e-12:
+            hb_baseline = 1e-12
+        factor_wav = hb_wav / hb_baseline
+        # If WAV highband is close to baseline → similar lossy footprint
+        if factor_wav <= 1.5:
+            return 1.0
+        elif factor_wav >= 6.0:
+            return 0.0
         else:
-            librosa.display.specshow(S_db, sr=sr, hop_length=512, x_axis='time', y_axis='linear')
-            plt.ylabel("Frequency (Hz)")
-        plt.title(title)
-        plt.colorbar(format="%+2.0f dB")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, filename), dpi=150)
-        plt.close()
+            return max(0.0, min(1.0, 1.0 - (factor_wav - 1.5) / (6.0 - 1.5)))
 
-    def save_residual_spectrogram(resid, sr, title, filename):
-        save_spectrogram(resid, sr, title, filename, log_scale=True)
+    comp_residual_full = residual_likelihood_component(residual_ratio_unknown, residual_ratio_baseline)
+    comp_residual_lp = residual_likelihood_component(residual_ratio_unknown_lp, residual_ratio_baseline_lp)
+    comp_corr = corr_likelihood_component(corr_wav_mp3, corr_baseline_mp3)
+    comp_highband = highband_likelihood_component(highband_mp3, highband_wav, highband_baseline)
 
-    # Waveforms
-    save_waveform(mp3, sr, "MP3 Waveform", "mp3_waveform.png")
-    save_waveform(wav, sr, "WAV Waveform", "wav_waveform.png")
+    # Pack components (0–1)
+    likelihood_components = {
+        "residual_full": comp_residual_full,
+        "residual_lowpassed": comp_residual_lp,
+        "correlation": comp_corr,
+        "highband_pattern": comp_highband,
+        "basic_similarity": basic_similarity,
+    }
 
-    # Spectrograms
-    save_spectrogram(mp3, sr, "MP3 Spectrogram (log freq)", "mp3_spec_log.png")
-    save_spectrogram(wav, sr, "WAV Spectrogram (log freq)", "wav_spec_log.png")
-    save_spectrogram(mp3, sr, "MP3 Spectrogram (linear freq)", "mp3_spec_lin.png")
-    save_spectrogram(wav, sr, "WAV Spectrogram (linear freq)", "wav_spec_lin.png")
+    # Component confidence labels (for HTML)
+    def component_label(name, score):
+        if score >= 0.85:
+            level = "HIGH"
+        elif score >= 0.65:
+            level = "MEDIUM"
+        elif score >= 0.45:
+            level = "LOW"
+        else:
+            level = "VERY LOW"
 
-    # Residual spectrogram
-    save_residual_spectrogram(resid, sr, "Residual Spectrogram (WAV - MP3)", "residual_spec_log.png")
+        if score >= 0.65:
+            trend = "Supports MP3-derived hypothesis"
+        elif score <= 0.35:
+            trend = "Points away from pure MP3-derived"
+        else:
+            trend = "Inconclusive on its own"
 
-    # -----------------------------
-    # HTML Report
-    # -----------------------------
-    return results
+        return f"{level} – {trend}"
 
-def generate_html(results: AnalysisResults, mp3_path, wav_path, out_html_path, out_dir):
-    def metric_row(m: MetricResult):
+    # Weighting: residuals heavy, correlation + similarity medium, highband moderate
+    likelihood_score_raw = (
+        0.30 * comp_residual_full
+        + 0.20 * comp_residual_lp
+        + 0.20 * comp_corr
+        + 0.15 * comp_highband
+        + 0.15 * basic_similarity
+    ) * 100.0
+
+    # Detection-biased calibration: nudge toward MP3-derived in ambiguous regimes
+    likelihood_score = likelihood_score_raw * 0.85 + 10.0
+    likelihood_score = float(max(0.0, min(100.0, likelihood_score)))
+
+    # Textual classification
+    if likelihood_score > 90:
+        verdict_text = "Extremely likely WAV is MP3-derived (or very tightly coupled to the MP3)."
+    elif likelihood_score > 75:
+        verdict_text = "Highly likely WAV is MP3-derived."
+    elif likelihood_score > 55:
+        verdict_text = "Moderately likely WAV is MP3-derived."
+    elif likelihood_score > 35:
+        verdict_text = "Inconclusive / mixed evidence."
+    elif likelihood_score > 15:
+        verdict_text = "Unlikely WAV is purely MP3-derived."
+    else:
+        verdict_text = "Very unlikely WAV is MP3-derived using this MP3 as source."
+
+    # -------------------------
+    # HTML REPORT
+    # -------------------------
+    print("Writing HTML report...")
+    html_path = os.path.join(WORKDIR, "report.html")
+
+    def metrics_table_row(m):
         return f"""
-            <tr>
-                <td>{m.name}</td>
-                <td>{m.value:.6g}</td>
-                <td>{m.confidence}</td>
-                <td>{m.explanation}</td>
-            </tr>
-        """
+<tr>
+  <td>{m['label']}</td>
+  <td>{m['rms']:.6f}</td>
+  <td>{m['peak']:.6f}</td>
+  <td>{m['crest_db']:.2f} dB</td>
+  <td>{m['lufs']:.2f} LUFS</td>
+</tr>
+"""
 
-    html = f"""<!DOCTYPE html>
+    def band_table_rows(label, bands_dict):
+        rows = ""
+        for (low, high, band_label) in bands:
+            val = bands_dict[band_label]
+            rows += f"<tr><td>{label}</td><td>{band_label}</td><td>{val:.6e}</td></tr>\n"
+        return rows
+
+    with open(html_path, "w") as f:
+        f.write(f"""
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Suno WAV vs MP3 Forensic Report</title>
-<style>
-body {{
-    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-    background: #0b0b0f;
-    color: #f4f4f5;
-    padding: 20px;
-}}
-h1, h2, h3 {{
-    color: #f9fafb;
-}}
-a {{
-    color: #38bdf8;
-}}
-.section {{
-    margin-bottom: 32px;
-    padding: 16px;
-    border-radius: 8px;
-    background: #111827;
-    border: 1px solid #1f2937;
-}}
-table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 12px;
-}}
-th, td {{
-    border: 1px solid #1f2937;
-    padding: 8px;
-    text-align: left;
-    vertical-align: top;
-}}
-th {{
-    background: #020617;
-}}
-.conf-High {{
-    color: #22c55e;
-    font-weight: 600;
-}}
-.conf-Medium {{
-    color: #eab308;
-    font-weight: 600;
-}}
-.conf-Low {{
-    color: #f97316;
-    font-weight: 600;
-}}
-.metric-table td:nth-child(3) {{
-    text-align: center;
-}}
-img {{
-    max-width: 100%;
-    border-radius: 6px;
-    margin: 8px 0;
-}}
-.badge {{
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 0.85rem;
-    margin-right: 8px;
-}}
-.badge-primary {{
-    background: #1d4ed8;
-    color: white;
-}}
-.badge-soft {{
-    background: #111827;
-    color: #e5e7eb;
-    border: 1px solid #374151;
-}}
-</style>
+  <meta charset="UTF-8">
+  <title>Suno WAV Forensics Report</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 30px;
+      background-color: #f5f5f5;
+      color: #222;
+    }}
+    h1, h2, h3 {{
+      margin-top: 1.5em;
+    }}
+    .score {{
+      font-size: 2em;
+      font-weight: bold;
+      padding: 10px 0;
+    }}
+    table {{
+      border-collapse: collapse;
+      margin: 15px 0;
+      width: 100%;
+      background: white;
+    }}
+    th, td {{
+      border: 1px solid #ccc;
+      padding: 6px 8px;
+      text-align: left;
+      font-size: 0.9em;
+    }}
+    th {{
+      background: #eee;
+    }}
+    img {{
+      max-width: 100%;
+      margin: 10px 0 30px 0;
+      border: 1px solid #ddd;
+      background: white;
+    }}
+    .section {{
+      background: #ffffff;
+      padding: 20px;
+      margin-bottom: 20px;
+      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }}
+    code {{
+      background: #eee;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }}
+  </style>
 </head>
 <body>
 
-<h1>Suno WAV vs MP3 Forensic Report</h1>
+<h1>Suno WAV Forensic Analysis</h1>
 
 <div class="section">
-  <h2>Overview</h2>
-  <p><span class="badge badge-primary">Heuristic Inference</span>
-     <span class="badge badge-soft">Not a cryptographic proof</span></p>
-  <p>This report compares two files:</p>
-  <ul>
-    <li><b>MP3</b>: {mp3_path}</li>
-    <li><b>WAV</b>: {wav_path}</li>
-  </ul>
-  <p>
-    It runs correlation, residual (null test), and spectral analysis to estimate how likely it is
-    that the WAV is derived from the same lossy MP3-like source, possibly with extra DSP
-    (e.g. exciter, EQ, upscaling).
-  </p>
-</div>
+  <h2>Headline Verdict</h2>
+  <p class="score">Estimated likelihood WAV is MP3-derived: <b>{likelihood_score:.2f}%</b></p>
+  <p><b>Interpretation:</b> {verdict_text}</p>
 
-<div class="section">
-  <h2>Headline Result</h2>
-  <h3>Estimated likelihood WAV is MP3-derived / MP3-processed: <b>{results.probability_mp3_derived:.2f}%</b></h3>
-  <p>{results.probability_explanation}</p>
-</div>
-
-<div class="section">
-  <h2>Metrics & Confidence Levels</h2>
-  <table class="metric-table">
-    <thead>
-      <tr>
-        <th>Metric</th>
-        <th>Value</th>
-        <th>Confidence</th>
-        <th>Interpretation</th>
-      </tr>
-    </thead>
-    <tbody>
-      {metric_row(results.correlation)}
-      {metric_row(results.residual_full_ratio)}
-      {metric_row(results.residual_low_ratio)}
-      {metric_row(results.hf_energy_mp3)}
-      {metric_row(results.hf_energy_wav)}
-      {metric_row(results.hf_ratio_wav_vs_mp3)}
-    </tbody>
+  <h3>Component Scores (0–1 scale)</h3>
+  <table>
+    <tr><th>Component</th><th>Score</th><th>Meaning</th><th>Confidence / Interpretation</th></tr>
+    <tr>
+      <td>Residual (Full-band)</td>
+      <td>{likelihood_components['residual_full']:.3f}</td>
+      <td>How closely WAV cancels against MP3 across the full spectrum compared to a known MP3-derived baseline.</td>
+      <td>{component_label('residual_full', likelihood_components['residual_full'])}</td>
+    </tr>
+    <tr>
+      <td>Residual (&lt;16 kHz)</td>
+      <td>{likelihood_components['residual_lowpassed']:.3f}</td>
+      <td>How closely WAV cancels against MP3 when focusing on frequencies below ~16 kHz.</td>
+      <td>{component_label('residual_lowpassed', likelihood_components['residual_lowpassed'])}</td>
+    </tr>
+    <tr>
+      <td>Phase Correlation</td>
+      <td>{likelihood_components['correlation']:.3f}</td>
+      <td>How similar the temporal / phase structure of WAV vs MP3 is, relative to baseline.</td>
+      <td>{component_label('correlation', likelihood_components['correlation'])}</td>
+    </tr>
+    <tr>
+      <td>High-band Pattern</td>
+      <td>{likelihood_components['highband_pattern']:.3f}</td>
+      <td>Whether the WAV high-frequency band behaves more like “MP3-derived” or “new independent content”.</td>
+      <td>{component_label('highband_pattern', likelihood_components['highband_pattern'])}</td>
+    </tr>
+    <tr>
+      <td>Basic Similarity (Loudness / Dynamics)</td>
+      <td>{likelihood_components['basic_similarity']:.3f}</td>
+      <td>How closely WAV matches MP3 in overall level, loudness, and crest factor.</td>
+      <td>{component_label('basic_similarity', likelihood_components['basic_similarity'])}</td>
+    </tr>
   </table>
 </div>
 
 <div class="section">
-  <h2>Waveforms</h2>
-  <h3>MP3 Waveform</h3>
-  <img src="mp3_waveform.png" alt="MP3 waveform" />
-  <h3>WAV Waveform</h3>
-  <img src="wav_waveform.png" alt="WAV waveform" />
+  <h2>Basic Signal Metrics</h2>
+  <p>Duration analyzed: <b>{duration_sec:.2f} s</b> at <b>{sr} Hz</b></p>
+  <table>
+    <tr>
+      <th>Signal</th><th>RMS</th><th>Peak</th><th>Crest Factor</th><th>Integrated LUFS</th>
+    </tr>
+    {metrics_table_row(metrics_mp3)}
+    {metrics_table_row(metrics_wav)}
+    {metrics_table_row(metrics_baseline)}
+  </table>
 </div>
 
 <div class="section">
-  <h2>Spectrograms (Log Frequency)</h2>
-  <h3>MP3</h3>
-  <img src="mp3_spec_log.png" alt="MP3 spectrogram (log)" />
-  <h3>WAV</h3>
-  <img src="wav_spec_log.png" alt="WAV spectrogram (log)" />
+  <h2>Residual Analysis (Null Tests)</h2>
+  <h3>Residual RMS Ratios (lower = closer to MP3)</h3>
+  <table>
+    <tr><th>Type</th><th>Residual RMS / MP3 RMS</th></tr>
+    <tr><td>Unknown WAV vs MP3 (full-band)</td><td>{residual_ratio_unknown:.6f}</td></tr>
+    <tr><td>Baseline MP3-derived vs MP3 (full-band)</td><td>{residual_ratio_baseline:.6f}</td></tr>
+    <tr><td>Unknown WAV vs MP3 (&lt;16 kHz)</td><td>{residual_ratio_unknown_lp:.6f}</td></tr>
+    <tr><td>Baseline MP3-derived vs MP3 (&lt;16 kHz)</td><td>{residual_ratio_baseline_lp:.6f}</td></tr>
+  </table>
+
+  <p>In a true “WAV is just a repackaged MP3” scenario, the unknown WAV residual ratios should be similar to the baseline
+  MP3-derived residual ratios. The closer they are, the more the WAV behaves like a decoded MP3.</p>
+
+  <h3>Residual Waveforms</h3>
+  <img src="wave_residual_unknown_full.png" alt="Residual Unknown Full">
+  <img src="wave_residual_baseline_full.png" alt="Residual Baseline Full">
+  <img src="wave_residual_unknown_zoom.png" alt="Residual Unknown Zoom">
+  <img src="wave_residual_baseline_zoom.png" alt="Residual Baseline Zoom">
+
+  <h3>Residual Histograms</h3>
+  <img src="hist_residual_unknown.png" alt="Residual Unknown Histogram">
+  <img src="hist_residual_baseline.png" alt="Residual Baseline Histogram">
 </div>
 
 <div class="section">
-  <h2>Spectrograms (Linear Frequency)</h2>
-  <h3>MP3</h3>
-  <img src="mp3_spec_lin.png" alt="MP3 spectrogram (linear)" />
-  <h3>WAV</h3>
-  <img src="wav_spec_lin.png" alt="WAV spectrogram (linear)" />
+  <h2>Phase Correlation</h2>
+  <table>
+    <tr><th>Comparison</th><th>Correlation</th></tr>
+    <tr><td>Unknown WAV vs MP3</td><td>{corr_wav_mp3:.4f}</td></tr>
+    <tr><td>Baseline MP3-derived vs MP3</td><td>{corr_baseline_mp3:.4f}</td></tr>
+  </table>
+  <p>Values near <b>1.0</b> indicate almost perfect time/phase alignment. If unknown WAV correlation is very close
+  to the baseline MP3-derived correlation, that’s additional evidence that it is sourced from the same MP3 data.</p>
 </div>
 
 <div class="section">
-  <h2>Residual Spectrogram (WAV − MP3)</h2>
-  <img src="residual_spec_log.png" alt="Residual spectrogram (WAV - MP3)" />
-  <p>
-    This shows what remains after subtracting the MP3 from the WAV. Broadband, low-level
-    energy is consistent with mild processing on top of the same lossy core; strong, structured
-    residuals would indicate a very different source.
-  </p>
+  <h2>Band Energy Distribution</h2>
+  <h3>Energy per Band</h3>
+  <table>
+    <tr><th>Signal</th><th>Band</th><th>Average Energy</th></tr>
+    {band_table_rows("MP3", band_mp3)}
+    {band_table_rows("WAV", band_wav)}
+    {band_table_rows("Baseline", band_baseline)}
+  </table>
+
+  <h3>High-band Ratios (16k–Nyquist as fraction of total)</h3>
+  <table>
+    <tr><th>Signal</th><th>High-band Ratio</th></tr>
+    <tr><td>MP3</td><td>{highband_mp3:.6e}</td></tr>
+    <tr><td>WAV</td><td>{highband_wav:.6e}</td></tr>
+    <tr><td>Baseline</td><td>{highband_baseline:.6e}</td></tr>
+  </table>
+
+  <p>If the MP3 shows a strong cutoff near 16 kHz (typical lossy behavior) but the WAV suddenly has a lot of energy in the
+  16k–Nyquist band, this may indicate some sort of “air reconstruction” or exciter. If the WAV high-band ratio is similar
+  to the baseline decoded MP3, that suggests it hasn’t gained real new high-frequency information.</p>
 </div>
 
 <div class="section">
-  <h2>Notes</h2>
+  <h2>Core Visuals: MP3 vs WAV vs Baseline</h2>
+
+  <h3>Waveforms (Full)</h3>
+  <img src="wave_mp3_full.png" alt="MP3 Waveform Full">
+  <img src="wave_wav_full.png" alt="WAV Waveform Full">
+  <img src="wave_baseline_full.png" alt="Baseline Waveform Full">
+
+  <h3>Waveforms (0–5s Zoom)</h3>
+  <img src="wave_mp3_zoom.png" alt="MP3 Waveform Zoom">
+  <img src="wave_wav_zoom.png" alt="WAV Waveform Zoom">
+  <img src="wave_baseline_zoom.png" alt="Baseline Waveform Zoom">
+
+  <h3>Amplitude Histograms</h3>
+  <img src="hist_mp3.png" alt="MP3 Histogram">
+  <img src="hist_wav.png" alt="WAV Histogram">
+</div>
+
+<div class="section">
+  <h2>Spectrogram Gallery</h2>
+  <p>For each of MP3 / WAV / Baseline / Residual, multiple color maps and scales are rendered. Look for:</p>
   <ul>
-    <li>All numerical metrics are computed after time-aligning and normalizing both signals.</li>
-    <li>Probability is a heuristic aggregation of multiple metrics; it is not a legal or cryptographic proof.</li>
-    <li>Confidence labels describe how strongly each metric alone supports the MP3-derived hypothesis.</li>
+    <li>Sharp cutoff around ~16 kHz (MP3 typical behavior).</li>
+    <li>"Air band" activity in WAV not present in MP3 (could be exciter / upscaler).</li>
+    <li>Residual spectrogram showing what’s actually different between signals.</li>
+  </ul>
+
+  <h3>MP3</h3>
+  <img src="spec_mp3_magma_log.png">
+  <img src="spec_mp3_viridis_log.png">
+  <img src="spec_mp3_plasma_log.png">
+
+  <h3>WAV</h3>
+  <img src="spec_wav_magma_log.png">
+  <img src="spec_wav_viridis_log.png">
+  <img src="spec_wav_plasma_log.png">
+
+  <h3>Baseline MP3-derived</h3>
+  <img src="spec_baseline_magma_log.png">
+  <img src="spec_baseline_viridis_log.png">
+  <img src="spec_baseline_plasma_log.png">
+
+  <h3>Residuals (Unknown vs MP3)</h3>
+  <img src="spec_residual_unknown_magma_log.png">
+  <img src="spec_residual_unknown_viridis_log.png">
+  <img src="spec_residual_unknown_plasma_log.png">
+
+  <h3>Residuals (Baseline vs MP3)</h3>
+  <img src="spec_residual_baseline_magma_log.png">
+  <img src="spec_residual_baseline_viridis_log.png">
+  <img src="spec_residual_baseline_plasma_log.png">
+</div>
+
+<div class="section">
+  <h2>Synthetic CHIRP Reference (Ground Truth of MP3 Damage)</h2>
+  <p>This section generates a synthetic wideband CHIRP (20 Hz → ~Nyquist), encodes it to MP3, and decodes back.
+  That gives you a “clean lab specimen” of exactly how MP3 behaves on full-band content.</p>
+
+  <h3>Spectrograms</h3>
+  <img src="spec_chirp_original_log.png" alt="Chirp Original Spectrogram">
+  <img src="spec_chirp_decoded_log.png" alt="Chirp MP3-decoded Spectrogram">
+
+  <p>Use this as a visual reference when comparing your Suno spectrograms to see if their
+  high-frequency behavior resembles standard MP3 artifacts, an excited/upscaled version, or something else.</p>
+</div>
+
+<div class="section">
+  <h2>How to Read This Report</h2>
+  <ul>
+    <li><b>If the unknown WAV nulls against the MP3 about as well as the baseline does</b> (both full-band and &lt;16kHz), and
+    phase correlations are close, that’s strong evidence it’s MP3-derived.</li>
+    <li><b>If the WAV has large residuals below 16 kHz</b> and a lot of genuinely different structure, it acts more like a
+    separate render / master.</li>
+    <li><b>If high-band (16k–Nyquist) energy appears only in WAV</b> and not MP3, especially with a smeared / “fake air”
+    texture in the spectrogram, that’s consistent with upscaling, exciters, or reconstruction algorithms rather than true
+    raw model output.</li>
   </ul>
 </div>
 
 </body>
 </html>
-"""
+""")
 
-    with open(out_html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    print("\nDone.")
+    print(f"Report written to: {html_path}")
+    print("Open it in your browser to inspect all metrics and visuals.")
 
-
-# -----------------------------
-# CLI
-# -----------------------------
-
-def main():
-    parser = argparse.ArgumentParser(description="Forensic comparison of Suno WAV vs MP3.")
-    parser.add_argument("--mp3", required=True, help="Path to reference MP3 file.")
-    parser.add_argument("--wav", required=True, help="Path to WAV file to test.")
-    parser.add_argument("--out", required=True, help="Path to HTML report output.")
-    parser.add_argument("--sr", type=int, default=44100, help="Sample rate for analysis (default: 44100).")
-
-    args = parser.parse_args()
-
-    out_dir = os.path.dirname(os.path.abspath(args.out)) or "."
-    results = run_analysis(args.mp3, args.wav, out_dir, sr=args.sr)
-    generate_html(results, args.mp3, args.wav, args.out, out_dir)
-
-    print(f"[+] Report written to: {args.out}")
-    print(f"[+] Heuristic MP3-derived likelihood: {results.probability_mp3_derived:.2f}%")
 
 if __name__ == "__main__":
     main()
